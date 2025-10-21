@@ -5,7 +5,12 @@ from collections import defaultdict
 #from cs336_basics.BPE import BPETokenizer,BPETokenizerParams,get_compression_ratio
 from cs336_basics.BPE import BPETokenizer,BPETokenizerParams,get_compression_ratio
 import numpy as np
+import time
+from multiprocessing import Pool, cpu_count
+import heapq
 
+import json
+from tests.common import gpt2_bytes_to_unicode
 # def find_chunk_boundaries(
 #     file: BinaryIO,
 #     desired_num_chunks: int,
@@ -18,256 +23,255 @@ import regex as re
 from collections import defaultdict,Counter
 import multiprocessing as mp
 from tqdm import tqdm
+class Node:
+    """表示词内一个 token 节点，便于链表原地更新。"""
+    def __init__(self, value, word_freq):
+        self.value = value
+        self.word_freq = word_freq  # 共享引用，节省内存
+        self.prev = None
+        self.next = None
 
+class PQItem:
+    """定义优先队列元素，实现自定义比较：频率优先，其次按字典序逆序。"""
+    def __init__(self, freq, id_pair, byte_pair):
+        self.freq = freq
+        self.id_pair = id_pair
+        self.byte_pair = byte_pair
 
-def choose_dtype(vocab_size: int):
-    """根据 vocab_size 自动选择最合适的 dtype"""
-    if vocab_size <= 65535:
-        return np.uint16
-    else:
-        return np.int32
+    def __lt__(self, other):
+        if self.freq != other.freq:
+            return self.freq > other.freq  # 频率高的先出
+        return self.byte_pair > other.byte_pair  # 字典序大的先出
 
-def worker(
-        idx_type,
-        task_queue,
-        result_queue,
-        input_path:str,
-        start:int,
-        end:int,
-        special_tokens: list[str] = None
-):
-    process_name = mp.current_process().name
-    #print(f"[子进程 {process_name}] 预分词开始")
-    # 比如：预分词、统计merge_hash、构造pretoken_list
-    
-    with open(input_path,"rb") as f:
-        f.seek(start)
-        data = f.read() if end is None else f.read(end - start)
-        all_chunks = data.decode("utf-8", errors="ignore")
-        #标准化换行
-        all_chunks = all_chunks.replace("\r\n", "\n").replace("\r", "\n")
-   
+def pre_tokenize_and_count(
+    args: tuple[bytes, list[str]]
+) -> Counter:
+    chunk_bytes, special_tokens = args
+    chunk = chunk_bytes.decode("utf-8", errors="ignore")
+    chunk = chunk.replace("\r\n", "\n").replace("\r", "\n")
     if special_tokens:
         pattern = "|".join(re.escape(tok) for tok in special_tokens)
         #!!
         #chunks = re.split(pattern, all_chunks)#去掉了special_token的大chunk
-        chunks = [c for c in re.split(pattern, all_chunks) if c]
+        chunk = [c for c in re.split(pattern, chunk) if c]
         #为什么一定要去掉空的：
     else:
-        chunks = [all_chunks]
+        chunk = [chunk] #再按照special_tokens切分为小段
 
-    local_merge_hash = Counter() 
-    local_occ = defaultdict(lambda: defaultdict(list))
-
-    pretoken_nps = []
-    for chunk_id, chunk in enumerate(
-        tqdm(chunks, desc=f"预分词 {process_name}", position=int(process_name.split('-')[-1]) - 1, leave=False)
-    ):
-        #循环每个去掉了special_token的大chunk
-        #（直接不给空的就行了）哪怕chunk为空也要继续执行，因为chunk_id在递增，需要添加一个空的pretoken        
-        pretokens  = []
-        for pretoken_id,match in enumerate(re.finditer(PAT, chunk)):#对每个chunk进行分词
-            # 用 np.frombuffer 直接转为 uint8 数组，避免中间 Python list
-            # pretoken = match.group(0) #分词后不再进行跨pretoken的统计
-            # pretoken = list(map(int, pretoken.encode("utf-8")))
-            pretoken = np.frombuffer(match.group(0).encode("utf-8"), dtype=np.uint8).astype(idx_type, copy=True)#使用int32或者int16
-            pretokens.append(pretoken)
-            for i, (index1, index2) in enumerate(zip(pretoken, pretoken[1:])):
-                pair = (index1, index2)
-                local_merge_hash[pair] += 1
-                local_occ[pair][(chunk_id,pretoken_id)].append(i)
-        pretoken_nps.append(pretokens)
-    #得到pretoken_list，local_merge_hash，local_occ
-    
-    #print(f"[子进程 {process_name}]得到local_merge_hash{local_merge_hash}")
-    result_queue.put(local_merge_hash)
-    print(f"[子进程 {process_name}] 完成发送local_merge_hash")
-    #子进程处理循环
-    while True:
-        task = task_queue.get()
-        if task is None:
-            print(f"子进程[{process_name}] 收到退出信号，退出")
-            break
-        maxpair,next_idx = task
-        chunk_dict = local_occ.get(maxpair)
-        if chunk_dict is None:
-            print(f"子进程 [{process_name}] 没有找到pair:{maxpair}")
-            result_queue.put(None)
-            continue
-        #删-改-增逻辑
-        #删除改tokenn里所有的occ（maxpair）记录以及merge_hash中的键值
-        for (chunk_id, pretoken_id), pos_list in list(chunk_dict.items()):
-            #之前报错是因为跳过了空的chunk
-            if chunk_id >= len(pretoken_nps):
-                print(f"[子进程[{process_name}]错误] chunk_id={chunk_id} 超出 pretoken_nps 长度 {len(pretoken_nps)}")
-            elif pretoken_id >= len(pretoken_nps[chunk_id]):
-                print(f"[子进程[{process_name}]错误] pretoken_id={pretoken_id} 超出 pretoken_nps[{chunk_id}] 长度 {len(pretoken_nps[chunk_id])}")
-            token = pretoken_nps[chunk_id][pretoken_id]
-            token = token.tolist()
-
-            pos_list = sorted(pos_list,reverse=True)
-              
-            #不仅删maxpair,还要删所有的pair
-            #local_occ[maxpair].pop((chunk_id, pretoken_id))
-            
-
-            pairs = list(zip(token[:-1], token[1:]))
-            local_merge_hash.subtract(pairs)
-            local_merge_hash += Counter()  # 清理掉 <=0 的项
-
-            #删除这个token中所有pair的记录，具体是删除occ中pair到这个token的所有字典值
-            for a, b in zip(token[:-1], token[1:]):
-                pair_dict = local_occ.get((a, b))#(a,b)在token中或许会反复出现，所以可能之前已经删除
-                if pair_dict:
-                    pair_dict.pop((chunk_id, pretoken_id), None)
-                    if not pair_dict:  # 如果这个pair没有任何位置记录了
-                        local_occ.pop((a, b), None)
-
-            for pos in pos_list:
-                token[pos:pos+2] = [next_idx]
-            pretoken_nps[chunk_id][pretoken_id] = np.array(token, dtype=idx_type)
-
-            for newpos , (a,b) in enumerate(zip(token[:-1],token[1:])): 
-                local_merge_hash[(a,b)]+=1
-                local_occ[(a,b)][(chunk_id, pretoken_id)].append(newpos)
-        result_queue.put(local_merge_hash)
-        local_occ.pop(maxpair, None)
-
-        #local_merge_hash.pop(maxpair, None)
+    words_list = [] #最后统一转化为Counter
+    for s_chunk in chunk:
+        for match in re.finditer(PAT, s_chunk):
+            byte_sequence = match.group(0).encode("utf-8")
+            id_sequence = tuple(byte_sequence)
+            words_list.append(id_sequence)
+    return Counter(words_list)
 
 def train_bpe(
-    input_path:str,
-    vocab_size: int,
-    special_tokens: list[str] = None   
-):
-    #准备四个大段
+        input_path:str,
+        vocab_size: int,
+        special_tokens: list[str] = None
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+
+    vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}
+    next_idx = 256
+    merges:list[tuple[int, int]] = []
+    special_tokens = special_tokens or []
+
+    #准备多进程参数
+    num_processes = 4
+    desired_num_chunks = 4
     with open(input_path, "rb") as f:
         desired_num_chunks = 4
         boundaries = find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
-        ranges = list(zip(boundaries[:-1],boundaries[1:]))
-    idx_type = choose_dtype(vocab_size)
-    num_processes = len(boundaries)-1
-    print(f"一共启动{num_processes}个进程")
-    #准备主进程变量
-    vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}
-    next_idx = 256
-    merges: list[tuple[int, int]] = []
-    special_tokens = special_tokens or []
-
-    #共享merge_hash
-    merge_hash = Counter()
-    #occ = defaultdict(lambda: defaultdict(list))
-    #准备多进程用的队列
-    task_queue = mp.Queue()
-    result_queue = mp.Queue()
-    processes = []
-    # def worker(
-        # task_queue,
-        # result_queue
-        # input_path:str,
-        # start:int,
-        # end:int,
-        # special_tokens: list[str] = None
-    # ):
-    for start, end in ranges:
-        p = mp.Process(target=worker, args=(idx_type,task_queue, result_queue, input_path, start, end, special_tokens))
-        p.start()
-        processes.append(p)
-
-    for _ in range(num_processes):
-        local_merge_hash = result_queue.get()
-        if local_merge_hash is None:
-            continue
-        merge_hash.update(local_merge_hash)
-    #print(f"主进程初始{merge_hash}")
-    while len(vocab) < vocab_size-len(special_tokens):
-        if not merge_hash:
-            break
-        print(f"\r合并进度: {len(vocab)-256}/{vocab_size-256-len(special_tokens)}", end="")
-        #!!
-        #pair = max(merge_hash.items(), key=lambda x: (x[1], x[0]))[0]
-        # 先找到最大频率
-        # max_freq = max(merge_hash.values())
-
-        # # 找出所有频率等于最大值的 pair
-        # ties = [(pair, freq) for pair, freq in merge_hash.items() if freq == max_freq]
-
-        # if len(ties) > 1:
-        #     print("⚠️ 出现频率相同的 pair：")
-        #     for pair, freq in ties:
-        #         print(f"  pair=({vocab[pair[0]]},{vocab[pair[1]]!r}), freq={freq}")
-
-        #然后再按原来的规则选出字典序最大的
-        pair = max(
-            merge_hash.items(),
-            key=lambda x: (
-                x[1],  # 频率优先
-                vocab[x[0][0]],
-                vocab[x[0][1]]
+        chunk_args = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk_bytes = f.read(end - start)
+            chunk_args.append(
+                (
+                    chunk_bytes,
+                    special_tokens
+                )
             )
-        )[0]
-        # if len(ties) > 1:
-        #     print(f"  pair=({vocab[pair[0]]},{vocab[pair[1]]!r}), freq={freq}")
-        index1, index2 = pair
-        merges.append((vocab[index1],vocab[index2]))
-        vocab[next_idx] = vocab[index1] + vocab[index2]
-        #分发任务
-        for _ in range(num_processes):
-            task_queue.put((pair,next_idx))
+    
+    processes_to_use = num_processes
+    if processes_to_use is None:
+        processes_to_use = min(cpu_count(), 8)
+
+    processes_to_use = min(processes_to_use, len(chunk_args))
+    all_word_freqs = Counter()#总的词频统计 turpe(int,)->int
+    start_time = time.time()
+
+    with Pool(processes=processes_to_use) as pool:
+        print(
+            f"Starting pre-tokenization with {processes_to_use} processes on {len(chunk_args)} chunks..."
+        )
+        results_iterator = pool.imap_unordered(pre_tokenize_and_count, chunk_args)
+        for chunk_counter in tqdm(
+            results_iterator, total=len(chunk_args), desc="Processing chunks", leave=True
+        ):
+            all_word_freqs.update(chunk_counter)#更新
+
+    print(f"Pre-tokenization and initial counting time: {time.time() - start_time:.2f} seconds")
+    
+    ### Pre-tokenization 结束
+    # 得到链表和pair到node的映射(pair指向链表)
+    pair_to_nodes = defaultdict(set)
+    for word_tuple, count in tqdm(all_word_freqs.items(), desc="Building", leave=True):
+        if len(word_tuple) < 2:
+            continue
+        # 所有链表节点共享 word_freq 引用，节省内存
+        word_freq = {'count': count}
+        head =  Node(word_tuple[0], word_freq)
+        prev_node = head
+        for i in range(1,len(word_tuple)):
+            curr_node = Node(word_tuple[i], word_freq)
+            prev_node.next = curr_node  
+            curr_node.prev = prev_node 
+
+            pair = (prev_node.value, curr_node.value) #int和word_freq
+            pair_to_nodes[pair].add(prev_node)#只加左节点
+            prev_node = curr_node  
+    
+    del all_word_freqs
+
+    #统计pair次数并建立最大堆
+    pair_freqs = Counter()
+    for pair, nodes in tqdm(pair_to_nodes.items(), desc="Counting pairs", leave=True):
+        pair_freqs[pair] = sum(node.word_freq["count"] for node in nodes)
+    pq = [
+        PQItem(freq, p, (vocab[p[0]], vocab[p[1]]))
+        for p,freq in pair_freqs.items()
+    ]
+    heapq.heapify(pq)
+
+    ### BPE 开始
+    merges = []
+    num_merges = vocab_size - len(vocab) - len(special_tokens)
+    pbar = tqdm(total=num_merges, desc="Performing BPE merges")
+
+    start_time = time.time()
+    for _ in range(num_merges):
+        if not pq:
+            break
+
+         # 取出频率最高的 pair，处理优先队列惰性删除的过期元素
+        best_pair = None
+        while pq:#找到对应的pair再继续执行，如果没有说明结束了
+            item = heapq.heappop(pq)
+            if item.id_pair not in pair_freqs:
+                continue  # 已经被合并删除
+            if pair_freqs[item.id_pair] == item.freq:
+                best_pair = item.id_pair
+                break
+
+        if best_pair is None:
+            break
         
-        merge_hash = Counter()
-        for _ in range(num_processes):
-            local_merge_hash = result_queue.get()
-            if local_merge_hash is None:
-                continue
-            merge_hash.update(local_merge_hash)
-        #print(f"主进程{merge_hash}")
-        #忘了
-        next_idx+=1
-    #结束进程
-    for _ in range(num_processes):
-        task_queue.put(None)
-    for p in processes:
-        p.join()
-    print("[主进程] 所有子进程已退出")
+        p1, p2 = best_pair
+
+        # 合成新 token，添加到 merges/vocab
+        merged_token_bytes = vocab[p1] + vocab[p2]
+        merges.append((vocab[p1], vocab[p2]))
+        vocab[next_idx] = merged_token_bytes
+
+
+        # 逐个更新包含改 pair 的词
+        nodes_to_process = list(pair_to_nodes[best_pair])
+        for node1 in nodes_to_process:
+            node2 = node1.next
+            if node2 is None:
+                continue#已经被删掉了（合并了）
+            word_freq = node1.word_freq['count']
+            if node1.prev:#需要更新链表，pair_to_nodes,pair_freqs,以及堆
+                left = node1.prev
+
+                old_left_pair = (left.value, node1.value)
+                pair_freqs[old_left_pair] -= word_freq
+                #修改后的pair_freqs
+                heapq.heappush(pq, PQItem(pair_freqs[old_left_pair], old_left_pair, (vocab[old_left_pair[0]], vocab[old_left_pair[1]])))
+
+                pair_to_nodes[old_left_pair].discard(left)#set add discard
+
+                new_left_pair = (left.value, next_idx)
+                pair_to_nodes[new_left_pair].add(left)
+                pair_freqs[new_left_pair] += word_freq
+                heapq.heappush(pq, PQItem(pair_freqs[new_left_pair], new_left_pair, (vocab[new_left_pair[0]], vocab[new_left_pair[1]])))
+            
+            if node2.next:
+                right = node2.next
+                old_right_pair = (node2.value, right.value)
+                pair_freqs[old_right_pair] -= word_freq
+                heapq.heappush(pq, PQItem(pair_freqs[old_right_pair], old_right_pair, (vocab[old_right_pair[0]], vocab[old_right_pair[1]])))
+
+                new_right_pair = (next_idx, right.value)
+                pair_to_nodes[old_right_pair].discard(node2)
+                pair_to_nodes[new_right_pair].add(node1)
+                pair_freqs[new_right_pair] += word_freq
+                heapq.heappush(pq, PQItem(pair_freqs[new_right_pair], new_right_pair, (vocab[new_right_pair[0]], vocab[new_right_pair[1]])))
+            
+            # 链表合并：node1、node2合成 next_idx
+            node1.value = next_idx #更新node1
+            node1.next = node2.next #丢掉node2
+            if node2.next:
+                node2.next.prev = node1
+
+        del pair_freqs[best_pair]
+        del pair_to_nodes[best_pair]
+        next_idx += 1
+        pbar.update(1)
+    
+    end_time = time.time()
+    print(f"Merge time: {end_time - start_time:.2f} seconds")
+    pbar.close()
+    
     for tok in special_tokens:
         vocab[next_idx] = tok.encode("utf-8") #得到utf-8编码，也是字节流
         next_idx += 1
     return vocab,merges
 
-import json
-
 def save_vocab(vocab, output_path: str):
-    # 把 bytes 转成 utf-8 字符串
-    vocab_str = {k: v.decode("utf-8", errors="replace") for k, v in vocab.items()}
+    byte_encoder = gpt2_bytes_to_unicode()
+    vocab_str = {
+        k: "".join(byte_encoder[b] for b in v)
+        for k, v in vocab.items()
+    }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(vocab_str, f, ensure_ascii=False, indent=2)
         
-import cProfile
-import pstats
+
 
 # merges: [(b'a', b'b'), (b'ab', b'c')]
 def save_merges(merges, output_path: str):
+    """
+    merges: list[tuple[bytes, bytes]]
+    保存为文本文件，每行 "token1 token2"
+    token 内部字节用 GPT-2 字节编码转成可见字符
+    """
+    byte_encoder = gpt2_bytes_to_unicode()
     with open(output_path, "w", encoding="utf-8") as f:
         for b1, b2 in merges:
-            token1 = b1.decode("utf-8", errors="replace")
-            token2 = b2.decode("utf-8", errors="replace")
+            token1 = "".join(byte_encoder[b] for b in b1)
+            token2 = "".join(byte_encoder[b] for b in b2)
             f.write(f"{token1} {token2}\n")
-
-
-
+import cProfile
+import pstats
+import pathlib
 if __name__ == "__main__":
     profiler = cProfile.Profile()
     profiler.enable()
 
+    BASE_DIR = pathlib.Path(__file__).resolve().parent
+    DATA_PATH = BASE_DIR / "../data/TinyStoriesV2-GPT4-valid.txt"
+
     vocab,merges = train_bpe(
-        input_path= r"E:\cs336\assignment1-basics\data\TinyStoriesV2-GPT4-valid.txt",
-        vocab_size = 1000,
+        input_path= DATA_PATH,
+        vocab_size = 10000,
         special_tokens = ["<|endoftext|>"]   
     )
 
-    save_vocab(vocab, "vocab1.json") 
-    save_merges(merges, "merges1.txt")
+    save_vocab(vocab, "vocab.json") 
+    save_merges(merges, "merges.txt")
 
     profiler.disable()
     stats = pstats.Stats(profiler).sort_stats("cumtime")  # 按累计耗时排序
