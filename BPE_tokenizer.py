@@ -5,7 +5,7 @@ import sys
 import psutil
 from collections import defaultdict
 from collections.abc import Iterable
-from typing import Iterator
+from typing import Iterator, List, Dict, Tuple
 
 
 def get_chunk_info(s: str, mem_ratio=0.05, min_chunk_mb=1, max_chunk_mb=100):
@@ -74,7 +74,7 @@ class tokenizer:
 
 
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str) -> List[int]:
         if text == "":
             return []
         num_chunks, _ = get_chunk_info(text)
@@ -141,7 +141,7 @@ class tokenizer:
             # 平展当前chunk的tokens并添加到输出
         
         return output_list
-    def _apply_bpe_merges(self, token_idx: list[int], merges_dict: dict) -> list[int]:
+    def _apply_bpe_merges(self, token_idx: List[int], merges_dict: dict) -> List[int]:
         if len(token_idx) <= 1:
             return token_idx
 
